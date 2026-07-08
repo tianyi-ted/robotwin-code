@@ -1,0 +1,4 @@
+Outlier Report - Mode: both - Total: 0
+============================================================
+Thresholds: Action > 3.0, State > 5.0
+
