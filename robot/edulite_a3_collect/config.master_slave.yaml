@@ -68,8 +68,8 @@ sdk:
   max_velocity: 1.0
   max_acceleration: 5.0
   # L7 夹爪使用 PP 位置模式，独立限制其速度和加速度。
-  gripper_velocity: 0.55
-  gripper_acceleration: 1.00
+  gripper_velocity: 0.70
+  gripper_acceleration: 1.30
   gravity_feedforward_ratio: 1.0
   limit_margin: 0.15
   limit_stop_margin: 0.03
@@ -83,8 +83,10 @@ kinesthetic:
 # 主臂 L7 使用 MIT 零力矩运控，周期反馈角度作为连续夹爪示教输入。
 master_gripper_control:
   enabled: true
-  # 先把主夹爪明确打开到 50% 以上，才激活从夹爪跟随。
-  activation_open_norm: 0.50
+  # 先把主夹爪明确打开到 30% 以上，才激活从夹爪跟随。
+  activation_open_norm: 0.30
+  # 主夹爪输入 0%～80% 线性映射到从夹爪 0%～100%，80% 以上饱和。
+  input_full_open_norm: 0.80
   command_rate_hz: 50
   # 参考旧 ROS 程序为 Kp=0/Kd=0.3/torque=0；此处降低 Kd 以减小手动阻力。
   teaching_kd: 0.05
@@ -98,7 +100,7 @@ master_gripper_control:
   filter_alpha: 0.45
   deadband_norm: 0.005
   # 限制归一化目标每秒最大变化，防止输入跳变。
-  max_target_rate_norm_s: 0.75
+  max_target_rate_norm_s: 1.00
   # 从夹爪力保护锁存后，主夹爪必须比保持位置再打开 5% 才解除。
   reopen_latch_margin_norm: 0.05
   feedback_timeout_s: 0.30

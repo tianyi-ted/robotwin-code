@@ -79,7 +79,8 @@ kinesthetic:
 
 master_gripper_control:
   enabled: false
-  activation_open_norm: 0.50
+  activation_open_norm: 0.30
+  input_full_open_norm: 0.80
   command_rate_hz: 50
   teaching_kd: 0.05
   motor_torque_limit_nm: 0.10
@@ -89,7 +90,7 @@ master_gripper_control:
   position_limit_margin_rad: 0.15
   filter_alpha: 0.45
   deadband_norm: 0.005
-  max_target_rate_norm_s: 0.75
+  max_target_rate_norm_s: 1.00
   reopen_latch_margin_norm: 0.05
   feedback_timeout_s: 0.30
 

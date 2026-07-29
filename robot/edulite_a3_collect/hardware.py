@@ -489,6 +489,9 @@ class MasterSlaveSingleRig:
         self._master_gripper_activation_open = float(
             master_gripper_cfg.get("activation_open_norm", 0.85)
         )
+        self._master_gripper_full_open_input = float(
+            master_gripper_cfg.get("input_full_open_norm", 1.0)
+        )
         self._master_gripper_reopen_margin = float(
             master_gripper_cfg.get("reopen_latch_margin_norm", 0.05)
         )
@@ -532,6 +535,15 @@ class MasterSlaveSingleRig:
         if not 0 <= self._master_gripper_activation_open <= 1:
             raise ValueError(
                 "master_gripper_control.activation_open_norm must be in [0, 1]"
+            )
+        if not 0 < self._master_gripper_full_open_input <= 1:
+            raise ValueError(
+                "master_gripper_control.input_full_open_norm must be in (0, 1]"
+            )
+        if self._master_gripper_activation_open > self._master_gripper_full_open_input:
+            raise ValueError(
+                "master_gripper_control.activation_open_norm must not exceed "
+                "input_full_open_norm"
             )
         if not 0 < self._master_gripper_reopen_margin <= 0.5:
             raise ValueError(
@@ -897,7 +909,9 @@ class MasterSlaveSingleRig:
                 f"feedback={self._master_gripper_feedback_refresh_rate:.1f} Hz). "
                 "Open the master gripper to "
                 f"norm>={self._master_gripper_activation_open:.2f} "
-                "to activate follower gripper control.",
+                "to activate follower gripper control; "
+                f"master norm 0.00..{self._master_gripper_full_open_input:.2f} "
+                "maps to follower norm 0.00..1.00.",
                 flush=True,
             )
         return master, slave
@@ -1113,6 +1127,9 @@ class MasterSlaveSingleRig:
         dt = max(now - self._master_gripper_last_update, period)
         self._master_gripper_last_update = now
         master_norm = self.master_gripper.normalize(float(master_feedback[6]))
+        mapped_norm = float(
+            np.clip(master_norm / self._master_gripper_full_open_input, 0.0, 1.0)
+        )
 
         release_latch = False
         with self._lock:
@@ -1127,7 +1144,8 @@ class MasterSlaveSingleRig:
                 self._master_gripper_filtered_norm = self.gripper.value
                 print(
                     "MASTER GRIPPER CONTROL ACTIVE: "
-                    f"input_norm={master_norm:.3f}",
+                    f"input_norm={master_norm:.3f}, "
+                    f"mapped_norm={mapped_norm:.3f}",
                     flush=True,
                 )
 
@@ -1138,17 +1156,17 @@ class MasterSlaveSingleRig:
                     1.0,
                     current_target + self._master_gripper_reopen_margin,
                 )
-                if master_norm < release_threshold:
+                if mapped_norm < release_threshold:
                     return
                 # Once the operator has explicitly opened beyond the held
                 # follower position, discard the previous closed-side filter
                 # history so the first post-latch command can only open.
-                self._master_gripper_filtered_norm = master_norm
+                self._master_gripper_filtered_norm = mapped_norm
                 release_latch = True
             else:
                 alpha = self._master_gripper_filter_alpha
                 self._master_gripper_filtered_norm = (
-                    alpha * master_norm
+                    alpha * mapped_norm
                     + (1.0 - alpha) * self._master_gripper_filtered_norm
                 )
 

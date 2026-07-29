@@ -126,7 +126,7 @@ python robot/edulite_a3_collect/collect.py --config /path/to/my_a3_collect.yaml
 2. 按 `r` 后等待 3 秒倒计时；此时两臂仍主动保持，尚未录制；
 3. 倒计时结束后确认终端显示 `Master L7 is MOTION ZERO-TORQUE PASSIVE`；
 4. 若进入示教后主夹爪仍有明显驱动力，立即急停；
-5. 手动把主夹爪打开到归一化 `0.50` 以上（当前标定约为 60°）；
+5. 手动把主夹爪打开到归一化 `0.30` 以上以激活夹爪跟随；
 6. 看到 `MASTER GRIPPER CONTROL ACTIVE` 后，主夹爪才开始连续控制从夹爪；
 7. 模式切换成功时程序同步开始录制；`s` 保存后退出示教并自动回位；
 8. 确实丢弃了一轮数据时，`d` 也会退出示教并自动回位；
@@ -134,6 +134,8 @@ python robot/edulite_a3_collect/collect.py --config /path/to/my_a3_collect.yaml
 10. `[`/`]` 和 `c/o` 仅作为键盘备用控制。
 
 倒计时时间由 `master_slave.start_delay_s` 配置；当前为 `3.0` 秒。
+主夹爪开度 `0.00～0.80` 线性映射为从夹爪开度 `0.00～1.00`，
+主夹爪超过 `0.80` 时从夹爪目标保持为完全打开。
 
 回位使用配置中的 `episode_reset` 速度、加速度、到位容差和超时参数。
 它是关节空间轨迹，不做环境碰撞规划；回位期间 L7 保持当前开度。

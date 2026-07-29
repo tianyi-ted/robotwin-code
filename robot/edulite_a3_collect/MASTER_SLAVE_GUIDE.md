@@ -64,7 +64,7 @@
 `0=完全闭合、1=完全打开`。主臂 L7 在示教期间运行低阻尼 MIT 零力矩运控；
 从臂 L7 仍保持 PP 位置控制。
 为避免按 `a` 时因主夹爪任意初始角度引起
-从夹爪运动，从夹爪最初保持当前位置，必须先把主夹爪明确打开到 `norm>=0.50`
+从夹爪运动，从夹爪最初保持当前位置，必须先把主夹爪明确打开到 `norm>=0.30`
 才会激活跟随。
 
 当前响应参数为：
@@ -249,7 +249,8 @@ L7 在回位过程中保持当前开度，不自动打开或关闭。回位完�
 ```yaml
 master_gripper_control:
   enabled: true
-  activation_open_norm: 0.50
+  activation_open_norm: 0.30
+  input_full_open_norm: 0.80
   command_rate_hz: 50
   teaching_kd: 0.05
   motor_torque_limit_nm: 0.10
@@ -259,10 +260,15 @@ master_gripper_control:
   position_limit_margin_rad: 0.15
   filter_alpha: 0.45
   deadband_norm: 0.005
-  max_target_rate_norm_s: 0.75
+  max_target_rate_norm_s: 1.00
   reopen_latch_margin_norm: 0.05
   feedback_timeout_s: 0.30
 ```
+
+映射公式为
+`follower_norm = clip(master_norm / input_full_open_norm, 0, 1)`。
+当前主夹爪的 `0%/40%/80%` 分别对应从夹爪的 `0%/50%/100%`；
+`activation_open_norm` 只决定何时允许开始跟随，不改变这条比例关系。
 
 旧 ROS 参考程序对主 L7 使用 `Kp=0、Kd=0.3、torque_ff=0`；当前程序把
 `Kd` 降至 `0.05` 以减小手动阻力，并设置 0.10 Nm/0.30 A 电机侧上限。
@@ -307,11 +313,11 @@ L7 使用 PP 位置模式，当前另有限速：
 
 ```yaml
 sdk:
-  gripper_velocity: 0.55
-  gripper_acceleration: 1.00
+  gripper_velocity: 0.70
+  gripper_acceleration: 1.30
 ```
 
-从夹爪完整 90° 行程的恒速理论下限由约 4.49 秒缩短到约 2.86 秒，
+从夹爪完整 90° 行程的恒速理论下限约为 2.24 秒，
 实际时间还会受到加速度、PP 控制器和负载影响。即使有限速，`c` 仍会最终
 到达机械完全关闭位置；夹持易碎物体时优先使用
 `[` 分步闭合。位置限速本身不是力控；下述力矩停止功能也必须标定后才能启用。
