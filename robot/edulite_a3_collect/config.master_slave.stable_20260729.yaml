@@ -1,0 +1,154 @@
+# Two physical arms can either be hand-guided together (14D, current VLA
+# compatible), or used as one master + one follower (7D, single-arm only).
+mode: master_slave_single  # can1=master, can0=follower
+
+# 已确认 CAN 后，为首次低速主从测试开启。
+# 注意：这不代表夹爪端点和 base 外参已经完成正式数据标定。
+hardware_calibrated: true
+
+collection:
+  output_root: ./collected_data
+  task_name: master_slave_test
+  split: demo_clean
+  rate_hz: 30
+  min_frames: 40
+  jpeg_quality: 95
+  camera_max_age_s: 0.25
+  # 每次 [ / ] 改变总夹爪行程的 2%（约 1.8° 电机角）。
+  gripper_step: 0.02
+  # master_slave_single only: "zero_right" pads 7D data to the current 14/16D
+  # interface. Keep "none" for a proper single-arm dataset.
+  single_arm_padding: zero_right
+  instructions:
+    seen:
+      - "perform a master slave teleoperation test"
+    unseen:
+      - "control the robot arm using the master arm"
+
+# The names must match dataset.camera_names in configs/robotwin.yaml.
+cameras:
+  - name: head_camera
+    source: 0
+    width: 320
+    height: 240
+    fps: 30
+    enabled: true
+
+arms:
+  # In bimanual mode these mean left and right task arms.  In master/slave
+  # mode, left is the hand-guided master and right is the physical follower.
+  left:
+    can_name: can1  # master arm
+    backend: socketcan
+    # Pose of this arm's URDF base in one shared task/world frame: metres/rad.
+    base_xyz: [0.0, 0.20, 0.0]
+    base_rpy: [0.0, 0.0, 0.0]
+    gripper:
+      # 上位机复核：角度增大=闭合，约 105° 闭合、15° 打开。
+      closed_rad: 1.8325957146
+      open_rad: 0.2617993878
+      initial_norm: 1.0
+  right:
+    can_name: can0  # follower arm
+    backend: socketcan
+    base_xyz: [0.0, -0.20, 0.0]
+    base_rpy: [0.0, 0.0, 0.0]
+    gripper:
+      # 实测 L7：70° 完全关闭，-20° 完全打开。
+      closed_rad: 1.2217304764
+      open_rad: -0.3490658504
+      initial_norm: 1.0
+
+sdk:
+  control_rate_hz: 200
+  position_kp: 45.0
+  position_kd: 3.0
+  # SDK EMA: 0 holds the old target; 1 is pass-through.
+  smoothing_alpha: 0.65
+  max_velocity: 1.0
+  max_acceleration: 5.0
+  # L7 夹爪使用 PP 位置模式，独立限制其速度和加速度。
+  gripper_velocity: 0.55
+  gripper_acceleration: 1.00
+  gravity_feedforward_ratio: 1.0
+  limit_margin: 0.15
+  limit_stop_margin: 0.03
+  inertia_config_path: resources/config/inertia_params.yaml
+  log_level: INFO
+
+kinesthetic:
+  # SDK adaptive damping remains active; this is its initial/reference Kd.
+  zero_torque_kd: 0.08
+
+# 主臂 L7 使用 MIT 零力矩运控，周期反馈角度作为连续夹爪示教输入。
+master_gripper_control:
+  enabled: true
+  # 先把主夹爪明确打开到 50% 以上，才激活从夹爪跟随。
+  activation_open_norm: 0.50
+  command_rate_hz: 50
+  # 参考旧 ROS 程序为 Kp=0/Kd=0.3/torque=0；此处降低 Kd 以减小手动阻力。
+  teaching_kd: 0.05
+  motor_torque_limit_nm: 0.10
+  motor_current_limit_a: 0.30
+  # 周期发送 Kp=0、torque_ff=0 的安全运控帧，同时更新 Type-2 角度反馈。
+  feedback_refresh_rate_hz: 50
+  feedback_refresh_timeout_s: 0.04
+  # 只接受当前实测标定行程外再放宽 0.15 rad；不沿用旧数据集的不同零偏。
+  position_limit_margin_rad: 0.15
+  filter_alpha: 0.45
+  deadband_norm: 0.005
+  # 限制归一化目标每秒最大变化，防止输入跳变。
+  max_target_rate_norm_s: 0.75
+  # 从夹爪力保护锁存后，主夹爪必须比保持位置再打开 5% 才解除。
+  reopen_latch_margin_norm: 0.05
+  feedback_timeout_s: 0.30
+
+gripper_control:
+  # 因闭合力矩曾过大，启动时不再自动运动。
+  initial_state: hold_current  # closed | open | hold_current
+  # 写入 L7 驱动器 0x700B，掉电丢失；程序每次启动都会写入并回读验证。
+  motor_torque_limit_nm: 0.10
+  # PP 位置模式明确使用的 0x7018 电流限制，同样掉电丢失。
+  motor_current_limit_a: 0.30
+  force_stop:
+    # 后续完整日志显示空载动态瞬态可达约 0.14 Nm，不能只靠低扭矩阈值判接触。
+    enabled: true
+    # 软停止由 0.08 提高至 0.12 Nm，并要求低速连续 3 帧，降低空载误触发。
+    torque_threshold_nm: 0.12
+    hard_torque_limit_nm: 0.18
+    ema_alpha: 0.50
+    consecutive_samples: 3
+    min_closing_time_s: 0.0
+    # 软阈值只有在夹爪接近停滞且仍有闭合位置误差时才表示接触。
+    max_contact_velocity_rad_s: 0.05
+    min_target_error_norm: 0.015
+    # 若电流限幅使扭矩没有越过软/硬阈值，持续停转仍视为接触并锁存。
+    stall_time_s: 0.30
+    max_stall_velocity_rad_s: 0.01
+    stall_torque_threshold_nm: 0.07
+    # 触发后保持检测位置，不主动张开；关闭锁存仍阻止继续增力。
+    backoff_norm: 0.0
+
+safety:
+  # 运行过程中保持严格；启动切换电机模式使用独立的较长握手时间。
+  feedback_timeout_s: 0.20
+  startup_feedback_timeout_s: 2.0
+
+master_slave:
+  rate_hz: 150
+  # Master displacement is mapped relative to engagement positions, avoiding
+  # an absolute-position jump when 'a' is pressed.
+  # 正式示教采用 1:1 相对关节位移映射。
+  scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # 若某个从臂关节运动方向相反，只翻转对应项的符号。
+  direction: [-1, 1, 1, 1, -1, -1]
+  # 响应型配置：仍保留二阶滤波、速度和加速度限制。
+  filter_omega: 18.0
+  max_velocity: [0.80, 0.80, 0.80, 1.00, 1.00, 1.00]
+  max_acceleration: [4.0, 4.0, 4.0, 5.0, 5.0, 5.0]
+  limit_margin: 0.15
+  # 只容许零位标定附近的小误差；明显越过硬限位时拒绝启动。
+  startup_limit_tolerance_rad: 0.08
+  max_follow_error_rad: 0.35
+  # 150 Hz 下 15 个周期约为 100 ms。
+  follow_error_cycles: 15

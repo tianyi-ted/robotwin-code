@@ -1,0 +1,142 @@
+# Two physical arms can either be hand-guided together (14D, current VLA
+# compatible), or used as one master + one follower (7D, single-arm only).
+mode: bimanual_kinesthetic  # bimanual_kinesthetic | master_slave_single
+
+# Deliberate hardware interlock.  Leave false until every item in README's
+# calibration checklist has been physically verified.
+hardware_calibrated: false
+
+collection:
+  output_root: ./collected_data
+  task_name: real_pick_and_place
+  split: demo_clean
+  rate_hz: 30
+  min_frames: 40
+  jpeg_quality: 95
+  camera_max_age_s: 0.25
+  gripper_step: 0.05
+  # master_slave_single only: "zero_right" pads 7D data to the current 14/16D
+  # interface. Keep "none" for a proper single-arm dataset.
+  single_arm_padding: none  # none | zero_right
+  instructions:
+    seen:
+      - "pick up the object and place it in the target area"
+    unseen:
+      - "move the item into the designated region"
+
+# The names must match dataset.camera_names in configs/robotwin.yaml.
+cameras:
+  - name: head_camera
+    source: 0
+    width: 640
+    height: 480
+    fps: 30
+    enabled: true
+
+arms:
+  # In bimanual mode these mean left and right task arms.  In master/slave
+  # mode, left is the hand-guided master and right is the physical follower.
+  left:
+    can_name: can0
+    backend: socketcan
+    # Pose of this arm's URDF base in one shared task/world frame: metres/rad.
+    base_xyz: [0.0, 0.20, 0.0]
+    base_rpy: [0.0, 0.0, 0.0]
+    gripper:
+      # PLACEHOLDERS: measure on your hardware. norm=0 closed, norm=1 open.
+      closed_rad: -0.70
+      open_rad: 0.70
+      initial_norm: 1.0
+  right:
+    can_name: can1
+    backend: socketcan
+    base_xyz: [0.0, -0.20, 0.0]
+    base_rpy: [0.0, 0.0, 0.0]
+    gripper:
+      closed_rad: -0.70
+      open_rad: 0.70
+      initial_norm: 1.0
+
+sdk:
+  control_rate_hz: 200
+  position_kp: 50.0
+  position_kd: 3.0
+  # SDK EMA: 0 holds the old target; 1 is pass-through.
+  smoothing_alpha: 0.35
+  max_velocity: 1.0
+  max_acceleration: 5.0
+  gripper_velocity: 0.8
+  gripper_acceleration: 2.0
+  gravity_feedforward_ratio: 1.0
+  limit_margin: 0.15
+  limit_stop_margin: 0.03
+  inertia_config_path: resources/config/inertia_params.yaml
+  log_level: WARNING
+
+kinesthetic:
+  # SDK adaptive damping remains active; this is its initial/reference Kd.
+  zero_torque_kd: 0.08
+
+master_gripper_control:
+  enabled: false
+  activation_open_norm: 0.50
+  command_rate_hz: 50
+  teaching_kd: 0.05
+  motor_torque_limit_nm: 0.10
+  motor_current_limit_a: 0.30
+  feedback_refresh_rate_hz: 50
+  feedback_refresh_timeout_s: 0.04
+  position_limit_margin_rad: 0.15
+  filter_alpha: 0.45
+  deadband_norm: 0.005
+  max_target_rate_norm_s: 0.75
+  reopen_latch_margin_norm: 0.05
+  feedback_timeout_s: 0.30
+
+gripper_control:
+  initial_state: hold_current
+  motor_torque_limit_nm: 0.10
+  motor_current_limit_a: 0.30
+  force_stop:
+    enabled: false
+    torque_threshold_nm: 0.30
+    hard_torque_limit_nm: 0.45
+    ema_alpha: 0.25
+    consecutive_samples: 5
+    min_closing_time_s: 0.10
+    max_contact_velocity_rad_s: 0.05
+    min_target_error_norm: 0.015
+    stall_time_s: 0.30
+    max_stall_velocity_rad_s: 0.01
+    stall_torque_threshold_nm: 0.07
+    backoff_norm: 0.01
+
+safety:
+  feedback_timeout_s: 0.20
+  startup_feedback_timeout_s: 2.0
+
+episode_reset:
+  enabled: false
+  target_deg: [0.0, 5.0, -5.0, 0.0, 0.0, 0.0]
+  home_on_arm: true
+  return_after_save: true
+  return_after_discard: true
+  max_velocity_rad_s: 0.25
+  max_acceleration_rad_s2: 0.50
+  tolerance_deg: 2.0
+  timeout_s: 20.0
+
+master_slave:
+  rate_hz: 100
+  start_delay_s: 3.0
+  # Master displacement is mapped relative to engagement positions, avoiding
+  # an absolute-position jump when 'a' is pressed.
+  scale: [1, 1, 1, 1, 1, 1]
+  direction: [1, 1, 1, 1, 1, 1]
+  filter_omega: 8.0
+  max_velocity: [0.7, 0.7, 0.7, 0.8, 0.8, 0.8]
+  max_acceleration: [3, 3, 3, 4, 4, 4]
+  limit_margin: 0.12
+  startup_limit_tolerance_rad: 0.08
+  max_follow_error_rad: 0.35
+  follow_error_cycles: 10

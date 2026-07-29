@@ -73,7 +73,7 @@ python utils/calc_stat_analysis.py \
   --root_dir /home/lab347-no10/Tianyi/RoboTwin/data \
   --output_path ./utils/stat.json \
   --outlier_path ./utils/outlier_files.txt \
-  --num_processes 16 \
+  --num_processes 12 \
   --data_mode clean
 ```
 

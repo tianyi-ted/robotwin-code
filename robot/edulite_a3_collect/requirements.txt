@@ -1,0 +1,5 @@
+numpy
+PyYAML
+h5py
+opencv-python
+# Real hardware additionally uses the dependencies declared by ../EDULITE_A3/el_a3_sdk

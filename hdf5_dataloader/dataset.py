@@ -42,7 +42,7 @@ def _decode(buf):
 
 
 class RobotWinTaskDataset(data.Dataset):
-    def __init__(self, dataset_dir, data_mode="clean", 
+    def __init__(self, dataset_dir, data_mode="both",
                  indices_config=None, camera_names=None, video_size=(320, 240), 
                  val=False, image_aug=False, vlm_checkpoint_path=None, stage1_mode=False):
         
@@ -148,35 +148,307 @@ class RobotWinTaskDataset(data.Dataset):
         
         logger.info(f"Index map built: {valid_ep_count} valid episodes, {len(self.valid_indices)} total searchable frames.")
 
-    def _preload_stage1_data(self):
-        """Stage 1: 多线程读取所有 Action 和 State 到内存"""
-        temp_actions, temp_states = [], []
+    # def _preload_stage1_data(self):
+    #     """Stage 1: 多线程读取所有 Action 和 State 到内存"""
+    #     temp_actions, temp_states = [], []
         
-        def load_single_file(ep_meta):
+    #     def load_single_file(ep_meta):
+    #         try:
+    #             with h5py.File(ep_meta['hdf5_path'], 'r') as f:
+    #                 action = f['joint_action']['vector'][:].astype(np.float32)
+    #                 l_pose = f['endpose']['left_endpose'][:]
+    #                 l_grip = f['endpose']['left_gripper'][:]
+    #                 r_pose = f['endpose']['right_endpose'][:]
+    #                 r_grip = f['endpose']['right_gripper'][:]
+    #                 if l_grip.ndim == 1: l_grip = l_grip[:, None]
+    #                 if r_grip.ndim == 1: r_grip = r_grip[:, None]
+    #                 state = np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=1).astype(np.float32)
+    #                 return action, state
+    #         except Exception: return None
+
+    #     with ThreadPoolExecutor(max_workers=NUM_THREADS*2) as executor:
+    #         futures = [executor.submit(load_single_file, meta) for meta in self.episode_metadata]
+    #         for future in tqdm(as_completed(futures), total=len(futures), desc="Preloading Stage 1 RAM"):
+    #             res = future.result()
+    #             if res is not None:
+    #                 act, sta = res
+    #                 temp_actions.append(act)
+    #                 temp_states.append(sta)
+
+    #     self.buffer_action = torch.from_numpy(np.concatenate(temp_actions, axis=0))
+    #     self.buffer_state = torch.from_numpy(np.concatenate(temp_states, axis=0))
+
+    def _preload_stage1_data(self):
+        """
+        Stage 1：并行读取所有 episode 的 Action/State 到内存。
+
+        修复点：
+        1. 不再按照线程完成顺序拼接数据。
+        2. 每个 episode 根据 global_start/global_end 写入固定位置。
+        3. 读取失败时立即报错，不再静默跳过。
+        4. 检查 episode 长度、维度和 NaN/Inf。
+        5. 检查所有 episode 是否都成功写入。
+        """
+        num_episodes = len(self.episode_metadata)
+        total_frames = len(self.valid_indices)
+
+        if num_episodes == 0:
+            raise RuntimeError("Stage 1 preload failed: no episode metadata found")
+
+        if total_frames == 0:
+            raise RuntimeError("Stage 1 preload failed: dataset contains no valid frames")
+
+        logger.info(
+            "Stage 1 preload: %d episodes, %d total frames",
+            num_episodes,
+            total_frames,
+        )
+
+        def load_single_file(ep_idx, ep_meta):
+            """
+            读取单个 episode。
+
+            注意：
+            - 不在这里捕获并吞掉异常。
+            - 异常会由 future.result() 重新抛出，并附带具体文件路径。
+            """
+            hdf5_path = ep_meta["hdf5_path"]
+
+            with h5py.File(hdf5_path, "r") as f:
+                # Action: [T, action_dim]
+                action = f["joint_action"]["vector"][:].astype(
+                    np.float32,
+                    copy=False,
+                )
+
+                # State components
+                left_pose = f["endpose"]["left_endpose"][:]
+                left_gripper = f["endpose"]["left_gripper"][:]
+                right_pose = f["endpose"]["right_endpose"][:]
+                right_gripper = f["endpose"]["right_gripper"][:]
+
+            # Gripper: [T] -> [T, 1]
+            if left_gripper.ndim == 1:
+                left_gripper = left_gripper[:, None]
+
+            if right_gripper.ndim == 1:
+                right_gripper = right_gripper[:, None]
+
+            # State: [T, 16]
+            state = np.concatenate(
+                [
+                    left_pose,
+                    left_gripper,
+                    right_pose,
+                    right_gripper,
+                ],
+                axis=1,
+            ).astype(np.float32, copy=False)
+
+            expected_len = ep_meta["length"]
+
+            # ---------- 数据一致性检查 ----------
+
+            if action.ndim != 2:
+                raise ValueError(
+                    f"Expected action to be 2D, got shape={action.shape}"
+                )
+
+            if state.ndim != 2:
+                raise ValueError(
+                    f"Expected state to be 2D, got shape={state.shape}"
+                )
+
+            if action.shape[0] != expected_len:
+                raise ValueError(
+                    f"Action length mismatch: "
+                    f"metadata={expected_len}, action={action.shape[0]}"
+                )
+
+            if state.shape[0] != expected_len:
+                raise ValueError(
+                    f"State length mismatch: "
+                    f"metadata={expected_len}, state={state.shape[0]}"
+                )
+
+            if not np.isfinite(action).all():
+                raise ValueError("Action contains NaN or Inf")
+
+            if not np.isfinite(state).all():
+                raise ValueError("State contains NaN or Inf")
+
+            return ep_idx, action, state
+
+        # 第一个成功返回的 episode 决定 action/state 的维度。
+        buffer_action = None
+        buffer_state = None
+
+        # 记录每条 episode 是否已经成功写入。
+        loaded_mask = np.zeros(num_episodes, dtype=bool)
+
+        # 避免 os.cpu_count() 很大时同时打开过多 HDF5 文件。
+        max_workers = max(
+            1,
+            min(32, NUM_THREADS, num_episodes),
+        )
+
+        logger.info(
+            "Stage 1 preload using %d worker threads",
+            max_workers,
+        )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ep_idx = {
+                executor.submit(
+                    load_single_file,
+                    ep_idx,
+                    ep_meta,
+                ): ep_idx
+                for ep_idx, ep_meta in enumerate(self.episode_metadata)
+            }
+
             try:
-                with h5py.File(ep_meta['hdf5_path'], 'r') as f:
-                    action = f['joint_action']['vector'][:].astype(np.float32)
-                    l_pose = f['endpose']['left_endpose'][:]
-                    l_grip = f['endpose']['left_gripper'][:]
-                    r_pose = f['endpose']['right_endpose'][:]
-                    r_grip = f['endpose']['right_gripper'][:]
-                    if l_grip.ndim == 1: l_grip = l_grip[:, None]
-                    if r_grip.ndim == 1: r_grip = r_grip[:, None]
-                    state = np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=1).astype(np.float32)
-                    return action, state
-            except Exception: return None
+                for future in tqdm(
+                    as_completed(future_to_ep_idx),
+                    total=num_episodes,
+                    desc="Preloading Stage 1 RAM",
+                ):
+                    submitted_ep_idx = future_to_ep_idx[future]
+                    ep_meta = self.episode_metadata[submitted_ep_idx]
 
-        with ThreadPoolExecutor(max_workers=NUM_THREADS*2) as executor:
-            futures = [executor.submit(load_single_file, meta) for meta in self.episode_metadata]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Preloading Stage 1 RAM"):
-                res = future.result()
-                if res is not None:
-                    act, sta = res
-                    temp_actions.append(act)
-                    temp_states.append(sta)
+                    try:
+                        ep_idx, action, state = future.result()
+                    except Exception as exc:
+                        hdf5_path = ep_meta["hdf5_path"]
 
-        self.buffer_action = torch.from_numpy(np.concatenate(temp_actions, axis=0))
-        self.buffer_state = torch.from_numpy(np.concatenate(temp_states, axis=0))
+                        # 尽量取消还未开始的任务。
+                        for pending_future in future_to_ep_idx:
+                            pending_future.cancel()
+
+                        raise RuntimeError(
+                            "Failed to preload Stage 1 episode: "
+                            f"episode_index={submitted_ep_idx}, "
+                            f"path={hdf5_path}"
+                        ) from exc
+
+                    if ep_idx != submitted_ep_idx:
+                        raise RuntimeError(
+                            "Internal preload index mismatch: "
+                            f"submitted={submitted_ep_idx}, returned={ep_idx}"
+                        )
+
+                    # 第一个完成的 episode 用于确定维度和分配总 buffer。
+                    if buffer_action is None:
+                        action_dim = action.shape[1]
+                        state_dim = state.shape[1]
+
+                        buffer_action = torch.empty(
+                            (total_frames, action_dim),
+                            dtype=torch.float32,
+                        )
+                        buffer_state = torch.empty(
+                            (total_frames, state_dim),
+                            dtype=torch.float32,
+                        )
+
+                        logger.info(
+                            "Allocated Stage 1 buffers: "
+                            "action=%s, state=%s",
+                            tuple(buffer_action.shape),
+                            tuple(buffer_state.shape),
+                        )
+
+                    # 检查所有 episode 的维度一致。
+                    if action.shape[1] != buffer_action.shape[1]:
+                        raise ValueError(
+                            "Inconsistent action dimension: "
+                            f"path={ep_meta['hdf5_path']}, "
+                            f"expected={buffer_action.shape[1]}, "
+                            f"actual={action.shape[1]}"
+                        )
+
+                    if state.shape[1] != buffer_state.shape[1]:
+                        raise ValueError(
+                            "Inconsistent state dimension: "
+                            f"path={ep_meta['hdf5_path']}, "
+                            f"expected={buffer_state.shape[1]}, "
+                            f"actual={state.shape[1]}"
+                        )
+
+                    # 关键修复：
+                    # 按 metadata 指定的全局位置写入，而不是 append。
+                    global_start = ep_meta["global_start"]
+                    global_end = ep_meta["global_end"]
+
+                    expected_len = global_end - global_start
+
+                    if expected_len != action.shape[0]:
+                        raise ValueError(
+                            "Global range length mismatch: "
+                            f"path={ep_meta['hdf5_path']}, "
+                            f"range_length={expected_len}, "
+                            f"action_length={action.shape[0]}"
+                        )
+
+                    buffer_action[global_start:global_end].copy_(
+                        torch.from_numpy(action)
+                    )
+
+                    buffer_state[global_start:global_end].copy_(
+                        torch.from_numpy(state)
+                    )
+
+                    loaded_mask[ep_idx] = True
+
+            except Exception:
+                # 不保留部分填充的 buffer。
+                buffer_action = None
+                buffer_state = None
+                raise
+
+        # ---------- 最终完整性检查 ----------
+
+        missing_episode_indices = np.flatnonzero(~loaded_mask)
+
+        if len(missing_episode_indices) > 0:
+            missing_paths = [
+                self.episode_metadata[i]["hdf5_path"]
+                for i in missing_episode_indices
+            ]
+
+            raise RuntimeError(
+                "Stage 1 preload incomplete. "
+                f"Missing episodes: {missing_paths}"
+            )
+
+        if buffer_action is None or buffer_state is None:
+            raise RuntimeError(
+                "Stage 1 preload failed: buffers were not initialized"
+            )
+
+        if buffer_action.shape[0] != total_frames:
+            raise RuntimeError(
+                "Action buffer length mismatch: "
+                f"expected={total_frames}, "
+                f"actual={buffer_action.shape[0]}"
+            )
+
+        if buffer_state.shape[0] != total_frames:
+            raise RuntimeError(
+                "State buffer length mismatch: "
+                f"expected={total_frames}, "
+                f"actual={buffer_state.shape[0]}"
+            )
+
+        self.buffer_action = buffer_action
+        self.buffer_state = buffer_state
+
+        logger.info(
+            "Stage 1 preload completed successfully: "
+            "action=%s, state=%s",
+            tuple(self.buffer_action.shape),
+            tuple(self.buffer_state.shape),
+        )
 
     # --- 文件扫描 ---
     def _scan_task_folder(self, task_path: Path, split_name: str) -> List[Dict[str, Any]]:

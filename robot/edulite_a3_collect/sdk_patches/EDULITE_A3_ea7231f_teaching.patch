@@ -1,0 +1,358 @@
+diff --git a/el_a3_sdk/README_zh.md b/el_a3_sdk/README_zh.md
+index 1ee87fa..2b5f356 100644
+--- a/el_a3_sdk/README_zh.md
++++ b/el_a3_sdk/README_zh.md
+@@ -294,6 +294,12 @@ ELA3Interface(
+ | `EndPoseCtrl(x, y, z, rx, ry, rz, duration, block=True)` | 末端位姿控制 |
+ | `CartesianVelocityCtrl(vx, vy, vz, wx, wy, wz)` | 笛卡尔速度控制 |
+ | `GripperCtrl(gripper_angle)` | 夹爪控制 |
++| `SetGripperPassiveMode(enable=True)` | L7 零电流被动示教模式（CURRENT + IQ_REF=0 A，带回读验证） |
++| `RefreshGripperPassiveMode()` | 限频刷新 L7 零电流命令；失败时调用方应安全停机 |
++| `DisableGripperForTeaching()` | 真正失能 L7，并验证新的失能状态应答 |
++| `RefreshDisabledGripperFeedback()` | 重发 L7 失能命令，并从新鲜 Type-2 应答读取角度（rad） |
++| `SetGripperMotionTeachingMode()` | L7 MIT 零力矩示教模式，验证运行模式和力矩/电流上限 |
++| `RefreshGripperMotionTeachingFeedback()` | 发送 Kp=0/低 Kd/零前馈帧并读取角度、力矩 |
+ | `is_moving()` | 查询轨迹是否在执行 |
+ | `wait_for_motion(timeout)` | 等待轨迹完成 |
+ | `cancel_motion()` | 取消当前轨迹 |
+diff --git a/el_a3_sdk/docs/SDK_API_Protocol.md b/el_a3_sdk/docs/SDK_API_Protocol.md
+index 457664c..00bb17e 100644
+--- a/el_a3_sdk/docs/SDK_API_Protocol.md
++++ b/el_a3_sdk/docs/SDK_API_Protocol.md
+@@ -440,6 +440,46 @@ GripperCtrl(
+ | `gripper_enable` | False 时失能 L7 电机 |
+ | `set_zero` | True 时设置 L7 零位 |
+ 
++#### SetGripperPassiveMode — 夹爪被动示教输入
++
++```python
++SetGripperPassiveMode(enable=True) -> bool
++```
++
++启用时只切换 L7：先失能，设置 `CURRENT` 模式并预写 `IQ_REF=0 A`，重新使能后
++再次写入零电流，最后回读验证运行模式和电流指令。验证失败会重新失能 L7 并
++返回 `False`。J1～J6 的运行模式和控制循环不受影响。
++
++```python
++RefreshGripperPassiveMode() -> bool
++```
++
++在被动示教期间周期重发 L7 的 `IQ_REF=0 A`。它不切换运行模式，也不改变
++J1～J6；用于持续声明零电流目标，并维持某些驱动器在 CURRENT 模式下的
++Type-2 反馈。调用方应限频，并在返回 `False` 时执行安全停机。
++
++```python
++DisableGripperForTeaching(timeout=0.3) -> bool
++RefreshDisabledGripperFeedback(timeout=0.04) -> Optional[float]
++```
++
++`DisableGripperForTeaching` 发送 L7 失能命令，并要求收到时间戳更新且状态为
++非 `MOTOR` 的反馈应答。失能后 Type-2 不再主动周期更新；
++`RefreshDisabledGripperFeedback` 重发 Type-4 失能命令，并从新鲜的 Type-2
++失能应答取得角度，应用 SDK 的 L7 方向和零偏后返回关节 rad。重发失能不会
++使能电机或输出电流。该组合用于需要物理回驱的主夹爪。
++
++```python
++SetGripperMotionTeachingMode(kd=0.05, torque_limit_nm=0.10,
++                             current_limit_a=0.30) -> bool
++RefreshGripperMotionTeachingFeedback(kd=0.05, timeout=0.04)
++    -> Optional[Tuple[float, float]]
++```
++
++这是当前采集器采用的主夹爪路径。L7 切换至 `MOTION_CONTROL`，回读验证模式
++及电机侧力矩/电流上限；周期帧固定 `Kp=0、torque_ff=0`，只保留不超过 0.30
++的低 `Kd`。刷新函数从新鲜 Type-2 应答返回应用方向/零偏后的角度和力矩。
++
+ #### MoveJ — 关节空间轨迹运动
+ 
+ ```python
+diff --git a/el_a3_sdk/el_a3_sdk/interface.py b/el_a3_sdk/el_a3_sdk/interface.py
+index 0854f2e..088fe6c 100644
+--- a/el_a3_sdk/el_a3_sdk/interface.py
++++ b/el_a3_sdk/el_a3_sdk/interface.py
+@@ -14,6 +14,7 @@ EL-A3 机械臂 SDK 主接口（纯 Python，无 ROS 依赖）
+ 底层使用 Robstride 私有协议（CAN 2.0 扩展帧），单位全部采用 SI（rad, m, Nm）。
+ """
+ 
++import math
+ import time
+ import threading
+ import logging
+@@ -848,6 +849,277 @@ class ELA3Interface:
+ 
+         return self._driver.set_position_pp(gripper_motor_id, gripper_angle)
+ 
++    def SetGripperPassiveMode(self, enable: bool = True) -> bool:
++        """Keep L7 enabled with fresh feedback but command zero q-axis current.
++
++        This is intended for a master gripper used as a passive teaching input.
++        It is deliberately separate from :meth:`ZeroTorqueMode`, which keeps
++        L7 in PP position mode.
++        """
++        if not self._connected:
++            logger.error("未连接，无法设置夹爪被动模式")
++            return False
++
++        mid = self.NUM_JOINTS
++        if enable:
++            # Preload IQ_REF=0 while disabled so enabling CURRENT mode cannot
++            # momentarily reuse a stale non-zero current command.
++            if not self._driver.disable_motor(mid, clear_fault=False):
++                return False
++            time.sleep(0.02)
++            if not self._driver.set_run_mode(mid, RunMode.CURRENT):
++                return False
++            time.sleep(0.02)
++            if not self._driver.write_parameter(mid, ParamIndex.IQ_REF, 0.0):
++                return False
++            time.sleep(0.02)
++            if not self._driver.enable_motor(mid):
++                return False
++            time.sleep(0.03)
++            if not self._driver.write_parameter(mid, ParamIndex.IQ_REF, 0.0):
++                self._driver.disable_motor(mid, clear_fault=False)
++                return False
++            time.sleep(0.03)
++
++            run_mode = self._driver.read_parameter(
++                mid, ParamIndex.RUN_MODE, timeout=0.3
++            )
++            iq_ref = self._driver.read_parameter(
++                mid, ParamIndex.IQ_REF, timeout=0.3
++            )
++            verified = (
++                run_mode is not None
++                and run_mode.success
++                and run_mode.value_uint8 == int(RunMode.CURRENT)
++                and iq_ref is not None
++                and iq_ref.success
++                and abs(float(iq_ref.value)) <= 1e-3
++            )
++            if not verified:
++                self._driver.disable_motor(mid, clear_fault=False)
++                logger.error("夹爪被动模式回读验证失败，L7 已失能")
++                return False
++            logger.warning(
++                "夹爪被动模式已启用 (L7 CURRENT, IQ_REF=0.000 A)"
++            )
++            return True
++
++        fb = self._driver.get_feedback(mid)
++        hold_position = fb.position if (fb and fb.is_valid) else 0.0
++        if not self._driver.disable_motor(mid, clear_fault=False):
++            return False
++        time.sleep(0.02)
++        if not self._driver.set_run_mode(mid, RunMode.POSITION_PP):
++            return False
++        time.sleep(0.02)
++        if not self._driver.enable_motor(mid):
++            return False
++        time.sleep(0.02)
++        if not self._driver.set_pp_velocity(mid, self._pp_velocity):
++            return False
++        if not self._driver.set_pp_acceleration(mid, self._pp_acceleration):
++            return False
++        if not self._driver.set_position_pp(mid, hold_position):
++            return False
++        logger.info("夹爪被动模式已关闭，L7 恢复 PP 并保持当前位置")
++        return True
++
++    def RefreshGripperPassiveMode(self) -> bool:
++        """Refresh the zero-current L7 command used during passive teaching.
++
++        Some drives do not keep publishing Type-2 feedback after a one-shot
++        CURRENT-mode command. Re-sending IQ_REF=0 maintains the explicit
++        zero-current command and the feedback heartbeat without changing mode.
++        """
++        if not self._connected:
++            logger.error("未连接，无法刷新夹爪被动模式")
++            return False
++        return self._driver.write_parameter(
++            self.NUM_JOINTS, ParamIndex.IQ_REF, 0.0
++        )
++
++    def DisableGripperForTeaching(self, timeout: float = 0.3) -> bool:
++        """Disable L7 and verify a fresh disabled-state response.
++
++        Unlike zero-current CURRENT mode, this removes motor drive torque and
++        is intended for a physically back-driven master gripper.
++        """
++        if not self._connected:
++            logger.error("未连接，无法将夹爪设为失能示教输入")
++            return False
++        mid = self.NUM_JOINTS
++        before = self._driver.get_feedback(mid)
++        before_ts = before.timestamp if (before and before.is_valid) else 0.0
++        if not self._driver.disable_motor(mid, clear_fault=False):
++            return False
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            fb = self._driver.get_feedback(mid)
++            if (
++                fb is not None
++                and fb.is_valid
++                and fb.timestamp > before_ts
++                and fb.mode_state != ModeState.MOTOR
++            ):
++                logger.warning("夹爪失能示教模式已启用 (L7 drive disabled)")
++                return True
++            time.sleep(0.005)
++        logger.error("未收到 L7 已失能的新鲜状态应答")
++        return False
++
++    def RefreshDisabledGripperFeedback(
++        self, timeout: float = 0.04
++    ) -> Optional[float]:
++        """Reassert L7 disable and return its fresh Type-2 position.
++
++        The EL05 used as L7 may stop answering Type-17 parameter reads while
++        disabled. A repeated Type-4 disable command keeps the drive disabled
++        and produces a fresh Type-2 response containing position.
++        """
++        if not self._connected:
++            return None
++        mid = self.NUM_JOINTS
++        before = self._driver.get_feedback(mid)
++        before_ts = before.timestamp if (before and before.is_valid) else 0.0
++        if not self._driver.disable_motor(mid, clear_fault=False):
++            return None
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            fb = self._driver.get_feedback(mid)
++            if (
++                fb is not None
++                and fb.is_valid
++                and fb.timestamp > before_ts
++                and fb.mode_state != ModeState.MOTOR
++            ):
++                raw_position = float(fb.position)
++                if not math.isfinite(raw_position):
++                    return None
++                direction = self._joint_directions.get(mid, 1.0)
++                offset = self._joint_offsets.get(mid, 0.0)
++                return (raw_position - offset) * direction
++            time.sleep(0.002)
++        return None
++
++    def SetGripperMotionTeachingMode(
++        self,
++        kd: float = 0.05,
++        torque_limit_nm: float = 0.10,
++        current_limit_a: float = 0.30,
++    ) -> bool:
++        """Put L7 in low-damping MIT zero-torque teaching mode.
++
++        Commands are always Kp=0 and torque_ff=0. The small Kd only damps
++        motion; motor-side torque/current limits provide an additional cap.
++        """
++        if not self._connected:
++            logger.error("未连接，无法设置夹爪运控示教模式")
++            return False
++        if not 0.0 <= kd <= 0.30:
++            logger.error("夹爪示教 Kd 必须在 [0, 0.30]")
++            return False
++        if not 0.0 < torque_limit_nm <= 0.30:
++            logger.error("夹爪示教力矩上限必须在 (0, 0.30] Nm")
++            return False
++        if not 0.0 < current_limit_a <= 0.50:
++            logger.error("夹爪示教电流上限必须在 (0, 0.50] A")
++            return False
++
++        mid = self.NUM_JOINTS
++        if not self._driver.disable_motor(mid, clear_fault=False):
++            return False
++        time.sleep(0.02)
++        if not self._driver.set_run_mode(mid, RunMode.MOTION_CONTROL):
++            return False
++        if not self._driver.write_parameter(
++            mid, ParamIndex.LIMIT_TORQUE, torque_limit_nm
++        ):
++            return False
++        if not self._driver.write_parameter(
++            mid, ParamIndex.LIMIT_CUR, current_limit_a
++        ):
++            return False
++        time.sleep(0.02)
++        if not self._driver.enable_motor(mid):
++            return False
++        time.sleep(0.03)
++
++        fb = self._driver.get_feedback(mid)
++        current_position = fb.position if (fb and fb.is_valid) else 0.0
++        if not self._driver.send_motion_control(
++            mid, current_position, 0.0, 0.0, kd, 0.0
++        ):
++            self._driver.disable_motor(mid, clear_fault=False)
++            return False
++        time.sleep(0.03)
++
++        run_mode = self._driver.read_parameter(
++            mid, ParamIndex.RUN_MODE, timeout=0.3
++        )
++        torque_limit = self._driver.read_parameter(
++            mid, ParamIndex.LIMIT_TORQUE, timeout=0.3
++        )
++        current_limit = self._driver.read_parameter(
++            mid, ParamIndex.LIMIT_CUR, timeout=0.3
++        )
++        verified = (
++            run_mode is not None
++            and run_mode.success
++            and run_mode.value_uint8 == int(RunMode.MOTION_CONTROL)
++            and torque_limit is not None
++            and torque_limit.success
++            and abs(float(torque_limit.value) - torque_limit_nm) <= 1e-3
++            and current_limit is not None
++            and current_limit.success
++            and abs(float(current_limit.value) - current_limit_a) <= 1e-3
++        )
++        if not verified:
++            self._driver.disable_motor(mid, clear_fault=False)
++            logger.error("夹爪运控示教模式回读验证失败，L7 已失能")
++            return False
++        logger.warning(
++            "夹爪运控示教模式已启用 "
++            "(L7 MOTION_CONTROL, Kp=0, Kd=%.3f, torque_ff=0, "
++            "limit=%.3f Nm/%.3f A)",
++            kd,
++            torque_limit_nm,
++            current_limit_a,
++        )
++        return True
++
++    def RefreshGripperMotionTeachingFeedback(
++        self, kd: float = 0.05, timeout: float = 0.04
++    ) -> Optional[Tuple[float, float]]:
++        """Send one safe MIT zero-torque L7 command and return position/torque."""
++        if not self._connected or not 0.0 <= kd <= 0.30:
++            return None
++        mid = self.NUM_JOINTS
++        before = self._driver.get_feedback(mid)
++        before_ts = before.timestamp if (before and before.is_valid) else 0.0
++        current_position = before.position if (before and before.is_valid) else 0.0
++        if not self._driver.send_motion_control(
++            mid, current_position, 0.0, 0.0, kd, 0.0
++        ):
++            return None
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            fb = self._driver.get_feedback(mid)
++            if (
++                fb is not None
++                and fb.is_valid
++                and fb.timestamp > before_ts
++                and fb.mode_state == ModeState.MOTOR
++            ):
++                direction = self._joint_directions.get(mid, 1.0)
++                offset = self._joint_offsets.get(mid, 0.0)
++                position = (float(fb.position) - offset) * direction
++                torque = float(fb.torque) * direction
++                if math.isfinite(position) and math.isfinite(torque):
++                    return position, torque
++                return None
++            time.sleep(0.002)
++        return None
++
+     # ================================================================
+     # 零力矩模式
+     # ================================================================

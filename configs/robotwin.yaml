@@ -19,7 +19,7 @@ dataset:
   dataset_dir: "/home/lab347-no10/Tianyi/RoboTwin/data"   # data-200
   
   # RobotWin specific parameters
-  data_mode: "clean"  # "clean", "randomized", or "both"
+  data_mode: "both"  # "clean", "randomized", or "both"
   # task_mode: "multi"  # "single" or "multi"
   # task_name: null     # Required for single task mode (e.g., "adjust_bottle")
   # Optional cap: limit randomized split to first N episodes per task
@@ -136,7 +136,7 @@ system:
   val_interval: 500     # Validate every N steps
   
   # Hardware settings
-  num_workers: 16         # Number of dataloader workers
+  num_workers: 12         # Number of dataloader workers
   pin_memory: true       # Pin memory for faster GPU transfer
 
 # Logging settings  

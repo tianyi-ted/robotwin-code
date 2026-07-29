@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import gc
 import matplotlib.pyplot as plt
 
 # 切换到 RoboTwin 项目目录（envs 模块依赖相对路径）
@@ -365,7 +366,22 @@ def eval_policy(task_name,
 
         step_counter = 0
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
-            observation = TASK_ENV.get_obs()
+            try:
+                observation = TASK_ENV.get_obs()
+            except RuntimeError as e:
+                print(f"\n渲染错误: {e}")
+                print("清理缓存并重试...")
+                for _ in range(3):
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                # 重建环境
+                TASK_ENV.close_env(clear_cache=True)
+                try:
+                    TASK_ENV.setup_demo(seed=seed, is_test=True, **args)
+                except Exception:
+                    print("重建环境失败，跳过本轮")
+                    break
+                observation = TASK_ENV.get_obs()
 
             current_action = model.step(observation, instruction)
             TASK_ENV.take_action(current_action, action_type='qpos')
@@ -412,7 +428,7 @@ def parse_args_and_config():
     parser.add_argument("--task_config", type=str, default='demo_clean')    # demo_clean / demo_randomized
 
     parser.add_argument("--config_path", type=str, default='configs/robotwin.yaml')
-    parser.add_argument("--norm_stats_path", type=str, default='utils/stat-200-10.json')
+    parser.add_argument("--norm_stats_path", type=str, default='utils/stat.json')
 
     parser.add_argument("--ckpt_setting", type=str, default='ig_2026-06-17_08-42-56')
     parser.add_argument("--checkpoint_ep", type=str, default='25')
@@ -435,10 +451,10 @@ if __name__ == "__main__":
     usr_args = parse_args_and_config()
 
     tasks_to_test = [
-        # "adjust_bottle", 
-        # "grab_roller",
-        # "hanging_mug",
-        # "move_stapler_pad",
+        "adjust_bottle",
+        "grab_roller",
+        "hanging_mug",
+        "move_stapler_pad",
         # "open_microwave",
         "beat_block_hammer",
         # "press_stapler",
@@ -460,6 +476,12 @@ if __name__ == "__main__":
         task_results[t_name] = suc_num
         total_suc += suc_num
         total_tests += usr_args["test_num"]
+
+        # === 任务间释放资源，防止 SAPIEN 渲染崩溃 ===
+        print(f"\n清理 {t_name} 的资源...")
+        for _ in range(3):
+            gc.collect()
+            torch.cuda.empty_cache()
 
     print("\n" + "="*50)
     print("所有任务测试完成！结果汇总：")

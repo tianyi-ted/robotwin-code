@@ -17,3 +17,8 @@ dataset/
 .vscode/
 *.log
 
+# Real-robot local dependencies and generated collection artifacts
+robot/EDULITE_A3/
+robot/ABPolicy-code/
+robot/edulite_a3_collect/collected_data/
+robot/edulite_a3_collect/camera_snapshots/
