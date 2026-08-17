@@ -1,0 +1,66 @@
+# EDULITE-A3 real-robot deployment configuration for the trained VLA.
+# Paths are resolved relative to this file.
+
+model:
+  config_path: ../../checkpoints_vla/place_block_30/stage2/2026-07-31_15-27-43/config.yaml
+  checkpoint_path: ../../checkpoints_vla/place_block_30/stage2/2026-07-31_15-27-43/checkpoint_epoch_400.pt
+  norm_stats_path: ../../utils/stat-edulite-pick-30.json
+  two_stage_mode: true
+  device: cuda
+  dtype: bfloat16
+  smooth_actions: true
+  smooth_sigma: 1.0
+  instruction: "pick up the red block and place it in the box"
+
+hardware:
+  # Reuse the exact CAN, joint, camera, FK and gripper calibration used to
+  # collect the training demonstrations.  In master_slave_single mode the
+  # physical task/follower arm is arms.right (can0).
+  collector_config_path: ../edulite_a3_collect/config.master_slave.yaml
+  arm_side: right
+  camera_name: head_camera
+
+runtime:
+  action_rate_hz: 30.0
+  control_rate_hz: 100.0
+  # A warm inference takes about 0.20 s on the current GPU. Start generating
+  # the next 16-action horizon while 8 actions (about 0.27 s) remain.
+  prefetch_threshold_actions: 8
+  start_delay_s: 3.0
+  max_episode_s: 40.0
+  camera_max_age_s: 0.25
+  require_preview_before_execute: true
+
+visualization:
+  enabled: true
+  # Resolved relative to this YAML file.
+  output_root: ./inference_outputs
+  save_video: true
+  video_fps: 30.0
+
+safety:
+  # Commands are clipped to both the mechanical soft limits and the action
+  # range observed in this training dataset.
+  clamp_to_training_range: true
+  joint_limit_margin_rad: 0.15
+  filter_omega: 10.0
+  max_velocity_rad_s: [0.35, 0.35, 0.35, 0.45, 0.45, 0.45]
+  max_acceleration_rad_s2: [1.2, 1.2, 1.2, 1.8, 1.8, 1.8]
+  # L7 conditioning mirrors the collection-time master-gripper path.  The
+  # EMA suppresses independent action-chunk boundary jumps; the slew limit
+  # matches the 1.0 norm/s limit used while collecting demonstrations.
+  gripper_filter_alpha: 0.45
+  gripper_max_target_rate_norm_s: 1.00
+  gripper_command_deadband_norm: 0.005
+  # Even after range clipping, one model update cannot move its requested
+  # joint target by more than this amount.
+  max_target_step_rad: [0.08, 0.08, 0.08, 0.10, 0.10, 0.10]
+  max_follow_error_rad: 0.30
+  follow_error_cycles: 20
+  feedback_timeout_s: 0.20
+  startup_feedback_timeout_s: 2.0
+  # A delayed inference holds the last safe command. It does not extrapolate.
+  model_command_timeout_s: 1.0
+  # Reject clearly invalid model outputs before any clipping is applied.
+  raw_joint_limit_tolerance_rad: 0.25
+  raw_gripper_tolerance: 0.20
