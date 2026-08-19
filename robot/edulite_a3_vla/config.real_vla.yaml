@@ -10,6 +10,10 @@ model:
   dtype: bfloat16
   smooth_actions: true
   smooth_sigma: 1.0
+  # This checkpoint was trained after the dataset loader resized the original
+  # 640x360 frames to 320x240.  Apply the identical OpenCV INTER_LINEAR resize
+  # before real-robot VLM inference.  Order is [width, height].
+  input_image_size: [320, 240]
   instruction: "pick up the red block and place it in the box"
 
 hardware:

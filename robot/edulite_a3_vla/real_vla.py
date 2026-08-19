@@ -522,7 +522,7 @@ class EDULITEVLAController:
     def return_home(self) -> None:
         """Pause the runtime loop, home L1-L6, then resume safe holding.
 
-        L7 deliberately keeps its current opening during this transition.  A
+        L7 deliberately keeps its current opening during this transition. A
         new model preview is required by the UI before the next execution.
         """
 
@@ -571,7 +571,7 @@ class EDULITEVLAController:
             self._thread.start()
             print(
                 "NEXT EPISODE HOME READY: L1-L6 are holding the trained start pose; "
-                "press p for a new preview",
+                "L7 kept its current opening; press p for a new preview",
                 flush=True,
             )
         except Exception:
@@ -929,6 +929,14 @@ def build_agent(config: dict):
     device = str(config["model"].get("device", "cuda"))
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA is requested but no CUDA GPU is visible")
+    image_size_value = config["model"].get("input_image_size")
+    input_image_size = None
+    if image_size_value is not None:
+        if not isinstance(image_size_value, (list, tuple)) or len(image_size_value) != 2:
+            raise ValueError("model.input_image_size must be [width, height]")
+        input_image_size = tuple(int(v) for v in image_size_value)
+        if any(v <= 0 for v in input_image_size):
+            raise ValueError("model.input_image_size values must be positive")
     return RobotWinInference(
         config_path=config["model"]["config_path"],
         checkpoint_path=config["model"]["checkpoint_path"],
@@ -938,6 +946,7 @@ def build_agent(config: dict):
         dtype=dtypes[dtype_name],
         smooth_actions=bool(config["model"].get("smooth_actions", True)),
         smooth_sigma=float(config["model"].get("smooth_sigma", 1.0)),
+        input_image_size=input_image_size,
     )
 
 
@@ -947,6 +956,12 @@ def print_static_report(config: dict, checked: dict) -> None:
     print(f"  checkpoint: {config['model']['checkpoint_path']}")
     print(f"  stats files: {meta.get('valid_files', 'unknown')}/{meta.get('total_files', 'unknown')}")
     print("  model schema: action=14, state=16, camera=head_camera")
+    image_size = config["model"].get("input_image_size")
+    if image_size is not None:
+        print(
+            "  VLM inference resize: "
+            f"{int(image_size[0])}x{int(image_size[1])} (width x height)"
+        )
     print("  deployed action: action[0:6] joints + action[6] gripper")
     print("  ignored action: action[7:14] synthetic right-arm padding")
     print(
@@ -1051,7 +1066,11 @@ def run_execute(config: dict, checked: dict) -> int:
                         )
                         preview_chunk = chunk.copy()
                         preview_ok = True
-                        visualizer.save_preview(frame.rgb, chunk)
+                        # Save the same resized RGB array that was passed to
+                        # the VLM, rather than the raw 640x360 camera frame.
+                        visualizer.save_preview(
+                            agent.processor.prepare_rgb(frame.rgb), chunk
+                        )
                 elif key == "r":
                     if not controller.armed:
                         print("Press a before execution")

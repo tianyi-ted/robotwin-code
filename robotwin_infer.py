@@ -1,4 +1,5 @@
 import os
+import cv2
 import torch
 import numpy as np
 import logging
@@ -37,13 +38,15 @@ class RobotWinInference:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         smooth_actions: bool = True,  # 是否开启平滑
-        smooth_sigma: float = 1.0     # 高斯滤波器的标准差
+        smooth_sigma: float = 1.0,    # 高斯滤波器的标准差
+        input_image_size: Optional[tuple[int, int]] = None,
     ):
         self.device = device
         self.dtype = dtype
         self.two_stage_mode = two_stage_mode
         self.smooth_actions = smooth_actions
         self.smooth_sigma = smooth_sigma
+        self.input_image_size = input_image_size
         
         # 动作队列: 用于存储当前 Chunk 中待执行的动作
         self.action_queue = deque()
@@ -130,6 +133,7 @@ class RobotWinInference:
             vlm_processor=self.vlm_processor,
             indices_config=indices_config,
             camera_name=self.config.dataset.get('camera_names', ['head_camera'])[0], # 默认取第一个相机
+            input_image_size=self.input_image_size,
             device=device,
             dtype=dtype
         )
@@ -246,6 +250,7 @@ class RobotWinInferenceProcessor:
         vlm_processor: Any, 
         indices_config: Dict[str, List[int]] = None,
         camera_name: str = 'head_camera',
+        input_image_size: Optional[tuple[int, int]] = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16
     ):
@@ -253,6 +258,20 @@ class RobotWinInferenceProcessor:
         self.device = device
         self.dtype = dtype
         self.camera_name = camera_name
+        if input_image_size is None:
+            self.input_image_size = None
+        else:
+            if len(input_image_size) != 2:
+                raise ValueError("input_image_size must be (width, height)")
+            width, height = (int(v) for v in input_image_size)
+            if width <= 0 or height <= 0:
+                raise ValueError("input_image_size width and height must be positive")
+            self.input_image_size = (width, height)
+            logger.info(
+                "Inference RGB resize enabled: input frames -> %dx%d before VLM processing",
+                width,
+                height,
+            )
         
         # 1. 配置历史长度
         self.state_indices = indices_config['state_indices']
@@ -301,6 +320,23 @@ class RobotWinInferenceProcessor:
         state_vec = np.concatenate([l_pose, l_grip, r_pose, r_grip], axis=0)
         return state_vec
 
+    def prepare_rgb(self, image: np.ndarray) -> np.ndarray:
+        """Return the exact RGB array that will be passed to the VLM processor."""
+        rgb = np.asarray(image)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError(f"camera RGB must have shape [H,W,3], got {rgb.shape}")
+        if rgb.dtype != np.uint8:
+            raise ValueError(f"camera RGB must be uint8, got {rgb.dtype}")
+        if self.input_image_size is not None:
+            current_size = (int(rgb.shape[1]), int(rgb.shape[0]))
+            if current_size != self.input_image_size:
+                rgb = cv2.resize(
+                    rgb,
+                    self.input_image_size,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+        return np.ascontiguousarray(rgb)
+
     def process(self, observation: Dict[str, Any], instruction: str) -> Dict[str, Any]:
         """
         处理推理输入。
@@ -318,7 +354,9 @@ class RobotWinInferenceProcessor:
         # 提取 RGB 图像 (Numpy uint8 [H, W, 3])
         # 注意环境返回的是 observation -> camera_name -> rgb
         if self.camera_name in observation['observation']:
-            img_np = observation['observation'][self.camera_name]['rgb']
+            img_np = self.prepare_rgb(
+                observation['observation'][self.camera_name]['rgb']
+            )
             
             # 转换为 PIL Image (VLM Processor 需要 PIL 或 List[PIL])
             pil_image = Image.fromarray(img_np)
@@ -398,15 +436,10 @@ if __name__ == "__main__":
         norm_stats_path="./utils/stat-200-10.json",
         two_stage_mode=True
     )
-    
+
     # 模拟环境循环
     # obs = env.reset()
     # agent.reset()
     # for i in range(100):
     #     action = agent.predict(obs, "pick up the apple")
     #     obs, _, _, _ = env.step(action)
-    
-    
-    
-    
-    
